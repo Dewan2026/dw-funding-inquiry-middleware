@@ -1,0 +1,34 @@
+{
+  "name": "Dewan Foundation Funding Inquiry Middleware",
+  "description": "Dewan Foundation Funding Inquiry Form — Salesforce integration middleware",
+  "repository": "https://github.com/Dewan2026/dw-funding-inquiry-middleware",
+  "keywords": ["salesforce", "dewan-foundation", "funding-inquiry"],
+  "env": {
+    "SF_CLIENT_ID": {
+      "description": "Salesforce External Client App Consumer Key",
+      "required": true
+    },
+    "SF_CLIENT_SECRET": {
+      "description": "Salesforce External Client App Consumer Secret",
+      "required": true
+    },
+    "SF_LOGIN_URL": {
+      "description": "Salesforce My Domain URL, e.g. https://thejohnandsusandewanfoundation.my.salesforce.com",
+      "required": true
+    },
+    "SF_OBJECT": {
+      "description": "API name of the Salesforce object that stores inquiry data",
+      "value": "Account",
+      "required": false
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  },
+  "buildpacks": [
+    { "url": "heroku/nodejs" }
+  ]
+}
