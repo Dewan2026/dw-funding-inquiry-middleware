@@ -126,6 +126,16 @@ async function sfQuery(instanceUrl, accessToken, soql) {
 }
 
 // ── SF REST HELPERS ───────────────────────────────────────────
+// Attaches the parsed Salesforce error array to the thrown Error (as
+// `.sfErrors`) so callers can inspect specific errorCodes/messages —
+// e.g. to turn a DUPLICATE_VALUE on EIN_Number__c into a friendly
+// message — rather than just having the raw JSON string.
+function sfError(prefix, object, body) {
+  const err = new Error(`${prefix} ${object} failed: ${JSON.stringify(body)}`);
+  err.sfErrors = Array.isArray(body) ? body : [body];
+  return err;
+}
+
 async function sfPost(instanceUrl, token, object, data) {
   const res = await fetch(
     `${instanceUrl}/services/data/v59.0/sobjects/${object}/`,
@@ -136,7 +146,7 @@ async function sfPost(instanceUrl, token, object, data) {
     }
   );
   const body = await res.json();
-  if (!res.ok) throw new Error(`SF POST ${object} failed: ${JSON.stringify(body)}`);
+  if (!res.ok) throw sfError('SF POST', object, body);
   return body;
 }
 
@@ -151,7 +161,7 @@ async function sfPatch(instanceUrl, token, object, id, data) {
   );
   if (res.status === 204) return { success: true };
   const body = await res.json();
-  if (!res.ok) throw new Error(`SF PATCH ${object} failed: ${JSON.stringify(body)}`);
+  if (!res.ok) throw sfError('SF PATCH', object, body);
   return body;
 }
 
@@ -323,6 +333,22 @@ app.post('/submit', async (req, res) => {
 
   } catch (err) {
     console.error('/submit error:', err.message);
+
+    // EIN_Number__c is a unique field on Account. If someone (re-)submits
+    // an EIN that already belongs to another Account, Salesforce blocks
+    // the write with DUPLICATE_VALUE — surface a clear, actionable message
+    // instead of the raw Salesforce error JSON. (The full SF error,
+    // including the existing record's Id, is still in the server log above.)
+    const dupEin = err.sfErrors && err.sfErrors.find(
+      e => e.errorCode === 'DUPLICATE_VALUE' && /EIN_Number__c/.test(e.message || '')
+    );
+    if (dupEin) {
+      return res.status(409).json({
+        success: false,
+        error: 'An organization with this EIN is already in our system. Please contact the Dewan Foundation directly rather than submitting a new inquiry.',
+      });
+    }
+
     res.status(500).json({ success: false, error: err.message });
   }
 });
