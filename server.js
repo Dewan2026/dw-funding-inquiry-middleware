@@ -208,6 +208,7 @@ app.post('/submit', async (req, res) => {
     //  "Workforce Development" that's "Job Training", not the label
     //  shown on the form.
     const inquiryFields = {
+      Type:                        'Nonprofit',
       Website:                     payload.website || '',
       Description:                 payload.description || '',
       Industry:                    payload.service || '',
