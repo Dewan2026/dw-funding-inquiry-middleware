@@ -10,10 +10,19 @@
 //  POST /submit                → Write inquiry data to Salesforce (Account)
 //
 //  Config (Heroku Config Vars):
-//    SF_CLIENT_ID       Consumer Key  (External Client App)
-//    SF_CLIENT_SECRET   Consumer Secret
-//    SF_LOGIN_URL       https://thejohnandsusandewanfoundation.my.salesforce.com
-//    SF_OBJECT          Salesforce object API name   (default: Account)
+//    SF_CLIENT_ID           Consumer Key  (External Client App)
+//    SF_CLIENT_SECRET       Consumer Secret
+//    SF_LOGIN_URL           https://thejohnandsusandewanfoundation.my.salesforce.com
+//    SF_OBJECT              Salesforce object API name   (default: Account)
+//    SF_ACCOUNT_RECORD_TYPE DeveloperName of the Account Record Type to use
+//                           for new inquiry Accounts (default: Organization).
+//                           Without this, new Accounts get created under
+//                           whatever the org's default Account Record Type
+//                           is — in an NPSP org that's typically "Household
+//                           Account", and NPSP automation then overwrites
+//                           Type back to "Household" regardless of what
+//                           this middleware sends, even though we explicitly
+//                           set Type: 'Nonprofit' below.
 // ============================================================
 
 const express = require('express');
@@ -29,6 +38,7 @@ const SF_CLIENT_ID      = process.env.SF_CLIENT_ID;
 const SF_CLIENT_SECRET  = process.env.SF_CLIENT_SECRET;
 const SF_LOGIN_URL      = process.env.SF_LOGIN_URL || 'https://login.salesforce.com';
 const SF_OBJECT         = process.env.SF_OBJECT || 'Account';
+const SF_ACCOUNT_RECORD_TYPE = process.env.SF_ACCOUNT_RECORD_TYPE || 'Organization';
 const PORT              = process.env.PORT || 3000;
 
 // ── INPUT VALIDATION HELPERS ─────────────────────────────────
@@ -68,6 +78,39 @@ async function getSFToken() {
   _token = data;
   _tokenExpiry = now + (110 * 60 * 1000); // cache for 110 min
   return _token;
+}
+
+// ── ACCOUNT RECORD TYPE CACHE ─────────────────────────────────
+// Looked up once by DeveloperName and cached for the life of the
+// dyno, same idea as the token cache above. If SF_ACCOUNT_RECORD_TYPE
+// doesn't match any active Account Record Type, we log a warning and
+// fall back to leaving RecordTypeId unset (old behavior) rather than
+// failing every submission.
+let _recordTypeId = null;
+let _recordTypeChecked = false;
+
+async function getAccountRecordTypeId(instanceUrl, accessToken) {
+  if (_recordTypeChecked) return _recordTypeId;
+  _recordTypeChecked = true;
+
+  try {
+    const soql = `
+      SELECT Id FROM RecordType
+      WHERE SObjectType = 'Account'
+      AND DeveloperName = '${SF_ACCOUNT_RECORD_TYPE.replace(/'/g, "\\'")}'
+      AND IsActive = true
+      LIMIT 1
+    `.trim();
+    const records = await sfQuery(instanceUrl, accessToken, soql);
+    if (records.length) {
+      _recordTypeId = records[0].Id;
+    } else {
+      console.warn(`No active Account Record Type found with DeveloperName "${SF_ACCOUNT_RECORD_TYPE}" — new Accounts will be created without an explicit RecordTypeId (org default will apply).`);
+    }
+  } catch (err) {
+    console.warn(`Account Record Type lookup failed: ${err.message} — proceeding without RecordTypeId.`);
+  }
+  return _recordTypeId;
 }
 
 // ── SF SOQL QUERY HELPER ──────────────────────────────────────
@@ -238,8 +281,14 @@ app.post('/submit', async (req, res) => {
       if (!payload.org_name) {
         return res.status(400).json({ success: false, error: 'org_name is required to create a new Account' });
       }
+      // Explicitly set RecordTypeId so the new Account isn't created under
+      // the org's default Record Type (Household Account, in NPSP orgs) —
+      // otherwise NPSP automation overwrites Type back to "Household" no
+      // matter what we send below.
+      const recordTypeId = await getAccountRecordTypeId(instance_url, access_token);
       const newRecord = await sfPost(instance_url, access_token, SF_OBJECT, {
         Name: payload.org_name,
+        ...(recordTypeId ? { RecordTypeId: recordTypeId } : {}),
         ...inquiryFields,
       });
       recordId = newRecord.id;
