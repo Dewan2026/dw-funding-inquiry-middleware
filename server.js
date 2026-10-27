@@ -7,7 +7,9 @@
 //
 //  GET  /accounts?zip=XXXXX   → Query SF Accounts by ZIP (dedupe check)
 //  GET  /accounts?name=XXXXX  → Query SF Accounts by Name (dedupe check)
-//  POST /submit                → Write inquiry data to Salesforce (Account)
+//  POST /submit                → Write inquiry data to Salesforce:
+//                                 Account (reused if the EIN already exists),
+//                                 Contact, and a new Funding Request
 //
 //  Config (Heroku Config Vars):
 //    SF_CLIENT_ID           Consumer Key  (External Client App)
@@ -23,6 +25,12 @@
 //                           Type back to "Household" regardless of what
 //                           this middleware sends, even though we explicitly
 //                           set Type: 'Nonprofit' below.
+//    SF_FUNDING_REQUEST_OBJECT  API name of the Funding Request object
+//                           (default: outfunds__Funding_Request__c)
+//    SF_FUNDING_PROGRAM_OBJECT  API name of the Funding Program object
+//                           (default: outfunds__Funding_Program__c)
+//    SF_FUNDING_PROGRAM_NAME    Name of the Funding Program every new
+//                           inquiry is linked to (default: New Funding Requests)
 // ============================================================
 
 const express = require('express');
@@ -39,6 +47,9 @@ const SF_CLIENT_SECRET  = process.env.SF_CLIENT_SECRET;
 const SF_LOGIN_URL      = process.env.SF_LOGIN_URL || 'https://login.salesforce.com';
 const SF_OBJECT         = process.env.SF_OBJECT || 'Account';
 const SF_ACCOUNT_RECORD_TYPE = process.env.SF_ACCOUNT_RECORD_TYPE || 'Organization';
+const SF_FUNDING_REQUEST_OBJECT = process.env.SF_FUNDING_REQUEST_OBJECT || 'outfunds__Funding_Request__c';
+const SF_FUNDING_PROGRAM_OBJECT = process.env.SF_FUNDING_PROGRAM_OBJECT || 'outfunds__Funding_Program__c';
+const SF_FUNDING_PROGRAM_NAME   = process.env.SF_FUNDING_PROGRAM_NAME   || 'New Funding Requests';
 const PORT              = process.env.PORT || 3000;
 
 // ── INPUT VALIDATION HELPERS ─────────────────────────────────
@@ -113,6 +124,70 @@ async function getAccountRecordTypeId(instanceUrl, accessToken) {
   return _recordTypeId;
 }
 
+// ── SOQL / VALUE HELPERS ──────────────────────────────────────
+function escSoql(v) {
+  return String(v || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+// "$25,000" / "25000.50" -> 25000.5. Returns null when empty or not a
+// positive number.
+function parseAmount(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(String(v).replace(/[$,\s]/g, ''));
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null;
+}
+
+// YYYY-MM-DD in the Foundation's time zone (Salesforce Date field).
+function todayCentral() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' });
+}
+
+// Funding Request Name is Text(80): "<Org name> - Funding Inquiry - YYYY-MM-DD"
+function buildFundingRequestName(orgName, dateStr) {
+  const suffix = ` - Funding Inquiry - ${dateStr}`;
+  const base = (orgName || 'Unnamed Organization').trim();
+  const room = 80 - suffix.length;
+  return (base.length > room ? base.slice(0, room - 1).trimEnd() + '…' : base) + suffix;
+}
+
+// ── DEDUPE: EXISTING ACCOUNT / CONTACT ────────────────────────
+// EIN_Number__c is unique on Account, so an EIN match is a reliable
+// "this organization is already in Salesforce" signal.
+async function findAccountIdByEin(instanceUrl, accessToken, ein) {
+  if (!ein) return null;
+  const records = await sfQuery(instanceUrl, accessToken,
+    `SELECT Id FROM Account WHERE EIN_Number__c = '${escSoql(ein)}' AND IsDeleted = false LIMIT 1`);
+  return records.length ? records[0].Id : null;
+}
+
+async function findContactIdByEmail(instanceUrl, accessToken, accountId, email) {
+  if (!email) return null;
+  const records = await sfQuery(instanceUrl, accessToken,
+    `SELECT Id FROM Contact WHERE AccountId = '${escSoql(accountId)}' AND Email = '${escSoql(email)}' AND IsDeleted = false LIMIT 1`);
+  return records.length ? records[0].Id : null;
+}
+
+// ── FUNDING PROGRAM CACHE ─────────────────────────────────────
+// Looked up by Name. Only cached when found, so fixing the name (or
+// creating the program) takes effect without a restart.
+let _fundingProgramId = null;
+
+async function getFundingProgramId(instanceUrl, accessToken) {
+  if (_fundingProgramId) return _fundingProgramId;
+  try {
+    const records = await sfQuery(instanceUrl, accessToken,
+      `SELECT Id FROM ${SF_FUNDING_PROGRAM_OBJECT} WHERE Name = '${escSoql(SF_FUNDING_PROGRAM_NAME)}' LIMIT 1`);
+    if (records.length) {
+      _fundingProgramId = records[0].Id;
+    } else {
+      console.warn(`No Funding Program named "${SF_FUNDING_PROGRAM_NAME}" — Funding Requests will be created without a Funding Program.`);
+    }
+  } catch (err) {
+    console.warn(`Funding Program lookup failed: ${err.message} — proceeding without a Funding Program.`);
+  }
+  return _fundingProgramId;
+}
+
 // ── SF SOQL QUERY HELPER ──────────────────────────────────────
 async function sfQuery(instanceUrl, accessToken, soql) {
   const encoded = encodeURIComponent(soql);
@@ -179,7 +254,7 @@ app.get('/', (req, res) => {
   res.json({
     status:   'ok',
     service:  'Dewan Foundation Funding Inquiry Middleware',
-    version:  '1.0',
+    version:  '1.1',
     object:   SF_OBJECT,
     endpoints: [
       'GET  /accounts?zip=XXXXX',
@@ -248,6 +323,21 @@ app.post('/submit', async (req, res) => {
       return res.status(400).json({ success: false, error: 'sf_account_id must be a valid Salesforce ID or "NEW"' });
     }
 
+    // Requested amount: optional server-side (so an older form keeps
+    // working), but if one is sent it must be a positive number.
+    const requestedAmount = parseAmount(payload.requested_amount);
+    if (payload.requested_amount && requestedAmount === null) {
+      return res.status(400).json({ success: false, error: 'Requested amount must be a positive number.' });
+    }
+
+    // Repeat inquiry from an organization already in Salesforce (matched
+    // by EIN)? Reuse that Account instead of creating a duplicate; the
+    // existing Account's data is left untouched.
+    let existingAccountId = null;
+    if (isNew && payload.ein) {
+      existingAccountId = await findAccountIdByEin(instance_url, access_token, payload.ein);
+    }
+
     const submissionId = generateSubmissionId();
     const timestamp     = payload.timestamp || new Date().toISOString();
 
@@ -263,7 +353,9 @@ app.post('/submit', async (req, res) => {
     const inquiryFields = {
       Type:                        'Nonprofit',
       Website:                     payload.website || '',
-      Description:                 payload.description || '',
+      // Question 1 only ("describe your organization"); how funding would
+      // be used goes on the Funding Request. Older forms send just `description`.
+      Description:                 payload.org_description || payload.description || '',
       Industry:                    payload.service || '',
       BillingStreet:               payload.street || '',
       BillingCity:                 payload.city || '',
@@ -287,7 +379,10 @@ app.post('/submit', async (req, res) => {
 
     let recordId, action;
 
-    if (isNew) {
+    if (existingAccountId) {
+      recordId = existingAccountId;
+      action   = 'existing';
+    } else if (isNew) {
       if (!payload.org_name) {
         return res.status(400).json({ success: false, error: 'org_name is required to create a new Account' });
       }
@@ -309,27 +404,54 @@ app.post('/submit', async (req, res) => {
       action   = 'updated';
     }
 
-    // ── PRIMARY CONTACT ─────────────────────────────────────────
-    //  Contacts go into the standard Contact object (not custom
-    //  fields on Account). Create the Contact linked to this Account,
-    //  then point the Account's Primary Contact lookup at it.
+    // ── CONTACT ─────────────────────────────────────────────────
+    //  Standard Contact object, linked to the Account. For a brand-new
+    //  Account it also becomes the Primary Contact; for an existing
+    //  Account we reuse a Contact with the same email if there is one
+    //  and leave the Account's Primary Contact alone.
     let contactId = null;
     if (payload.firstname || payload.lastname || payload.email) {
-      const newContact = await sfPost(instance_url, access_token, 'Contact', {
-        FirstName: payload.firstname || '',
-        LastName:  payload.lastname  || '(unknown)', // Contact.LastName is required
-        Email:     payload.email     || '',
-        Title:     payload.title     || '',
-        AccountId: recordId,
-      });
-      contactId = newContact.id;
+      if (action === 'existing') {
+        contactId = await findContactIdByEmail(instance_url, access_token, recordId, payload.email);
+      }
+      if (!contactId) {
+        const newContact = await sfPost(instance_url, access_token, 'Contact', {
+          FirstName: payload.firstname || '',
+          LastName:  payload.lastname  || '(unknown)', // Contact.LastName is required
+          Email:     payload.email     || '',
+          Title:     payload.title     || '',
+          AccountId: recordId,
+        });
+        contactId = newContact.id;
 
-      await sfPatch(instance_url, access_token, SF_OBJECT, recordId, {
-        npe01__One2OneContact__c: contactId,
-      });
+        if (action !== 'existing') {
+          await sfPatch(instance_url, access_token, SF_OBJECT, recordId, {
+            npe01__One2OneContact__c: contactId,
+          });
+        }
+      }
     }
 
-    res.json({ success: true, submissionId, record: { action, recordId, contactId } });
+    // ── FUNDING REQUEST ─────────────────────────────────────────
+    //  One new Funding Request per submission. Status and Record Type
+    //  are intentionally left unset (org defaults apply).
+    const fundingProgramId = await getFundingProgramId(instance_url, access_token);
+    const fundingUse = payload.funding_use || payload.description || '';
+    const fundingRequest = await sfPost(instance_url, access_token, SF_FUNDING_REQUEST_OBJECT, {
+      Name:                              buildFundingRequestName(payload.org_name, todayCentral()),
+      outfunds__Applying_Organization__c: recordId,
+      ...(contactId        ? { outfunds__Applying_Contact__c: contactId } : {}),
+      ...(fundingProgramId ? { outfunds__FundingProgram__c: fundingProgramId } : {}),
+      outfunds__Requested_For__c:        fundingUse,
+      ...(requestedAmount !== null ? { outfunds__Requested_Amount__c: requestedAmount } : {}),
+      outfunds__Application_Date__c:     todayCentral(),
+    });
+
+    res.json({
+      success: true,
+      submissionId,
+      record: { action, recordId, contactId, fundingRequestId: fundingRequest.id },
+    });
 
   } catch (err) {
     console.error('/submit error:', err.message);
@@ -354,7 +476,7 @@ app.post('/submit', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Dewan Foundation Funding Inquiry middleware v1 on port ${PORT}`);
+  console.log(`Dewan Foundation Funding Inquiry middleware v1.1 on port ${PORT}`);
   console.log(`SF Login:  ${SF_LOGIN_URL}`);
   console.log(`SF Object: ${SF_OBJECT}`);
   console.log(`Endpoints: GET /accounts  POST /submit`);
