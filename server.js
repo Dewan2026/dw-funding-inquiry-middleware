@@ -443,6 +443,8 @@ app.post('/submit', async (req, res) => {
       ...(contactId        ? { outfunds__Applying_Contact__c: contactId } : {}),
       ...(fundingProgramId ? { outfunds__FundingProgram__c: fundingProgramId } : {}),
       outfunds__Requested_For__c:        fundingUse,
+      // Solar__c is a checkbox on the Funding Request; the form sends true/false.
+      ...(typeof payload.solar === 'boolean' ? { Solar__c: payload.solar } : {}),
       ...(requestedAmount !== null ? { outfunds__Requested_Amount__c: requestedAmount } : {}),
       outfunds__Application_Date__c:     todayCentral(),
     });
